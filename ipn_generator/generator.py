@@ -94,6 +94,10 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
             logger.debug("IPN Generator: Event Model is not part")
             return
 
+        if event.endswith(".deleted"):
+            logger.debug("IPN Generator: Event part deleted")
+            return
+
         # Don't create IPNs for parts with IPNs
         part = Part.objects.get(id=id)
         if part.IPN:
