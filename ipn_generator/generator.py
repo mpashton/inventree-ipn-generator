@@ -127,18 +127,9 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
         if not category:
             return pattern
 
-        prefix = None
-
-        if hasattr(category, "get_metadata"):
-            try:
-                prefix = category.get_metadata("prefix", None)
-            except TypeError:
-                prefix = category.get_metadata("prefix")
-            except Exception:  # pragma: no cover - defensive, depends on InvenTree version
-                prefix = None
-        elif hasattr(category, "metadata"):
-            metadata = category.metadata or {}
-            prefix = metadata.get("prefix")
+        prefix = category.get_parameter("IPN Prefix")
+        if prefix:
+            prefix = prefix.data
 
         if not prefix:
             return pattern
