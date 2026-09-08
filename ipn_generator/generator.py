@@ -1,11 +1,10 @@
-from plugin import InvenTreePlugin
-from plugin.mixins import EventMixin, SettingsMixin
-from part.models import Part
-
-from django.core.exceptions import ValidationError
-
 import logging
 import re
+
+from django.core.exceptions import ValidationError
+from part.models import Part
+from plugin import InvenTreePlugin
+from plugin.mixins import EventMixin, SettingsMixin
 
 logger = logging.getLogger("inventree")
 
@@ -127,9 +126,19 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
         if not category:
             return pattern
 
-        prefix = category.get_parameter("IPN Prefix")
-        if prefix:
-            prefix = prefix.data
+        prefix = None
+        prefix_param = category.get_parameter("IPN Prefix")
+        if prefix_param:
+            prefix = prefix_param.data
+            logging.error(f"prefix param part #{part.id} param: #{prefix}")
+
+        else:
+            while category.parent is not None:
+                category = category.parent
+                prefix_param = category.get_parameter("IPN Prefix")
+                if prefix_param:
+                    prefix = prefix_param.data
+                    break
 
         if not prefix:
             return pattern
@@ -140,7 +149,9 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
         if not sanitized_prefix:
             return pattern
 
-        return re.sub(r"\([\w\(\)\-.:/\\]+\)", f"({sanitized_prefix})", pattern, count=1)
+        return re.sub(
+            r"\([\w\(\)\-.:/\\]+\)", f"({sanitized_prefix})", pattern, count=1
+        )
 
     def construct_regex(self, pattern=None, disable_groups=False):
         """Constructs a valid regex from provided IPN pattern.
@@ -202,8 +213,8 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
                         exp.append(range)
 
                 if not disable_groups:
-                    regex += f'{"_".join(exp).replace("-", "")}i{idx}>'
-                regex += f'[{"".join(exp)}]'
+                    regex += f"{'_'.join(exp).replace('-', '')}i{idx}>"
+                regex += f"[{''.join(exp)}]"
                 regex += ")"
 
         regex += "$"
