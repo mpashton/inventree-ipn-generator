@@ -23,13 +23,13 @@ def validate_pattern(pattern):
 class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
     """Plugin to generate IPN automatically"""
 
-    AUTHOR = "Nichlas W."
+    AUTHOR = "Nichlas W. et al"
     DESCRIPTION = (
         "Plugin for automatically assigning IPN to parts created with empty IPN fields.\
         IPN pattern syntax can be found on the website linked here."
     )
     VERSION = "0.1"
-    WEBSITE = "https://github.com/LavissaWoW/inventree-ipn-generator"
+    WEBSITE = "https://github.com/mpashton/inventree-ipn-generator"
 
     NAME = "IPNGenerator"
     SLUG = "ipngen"
@@ -100,7 +100,7 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
 
         # Don't create IPNs for parts with IPNs
         part = Part.objects.get(id=id)
-        if part.IPN:
+        if part.IPN != "auto":
             return
 
         pattern = self.get_pattern_for_part(part)
