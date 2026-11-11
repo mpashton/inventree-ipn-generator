@@ -1,14 +1,12 @@
 import logging
-import re
 
 from django.core.exceptions import ValidationError
 from part.models import Part
 from plugin import InvenTreePlugin
 from plugin.mixins import EventMixin, SettingsMixin
+from . import ipn_pattern
 
 logger = logging.getLogger("inventree")
-
-PERMITTED_SPECIAL_LITERALS = r"\-.:/\\"
 
 
 def validate_pattern(pattern):
@@ -23,7 +21,7 @@ def validate_pattern(pattern):
 class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
     """Plugin to generate IPN automatically"""
 
-    AUTHOR = "Nichlas W. et al"
+    AUTHOR = "Michael Ashton, Nichlas W., et al"
     DESCRIPTION = (
         "Plugin for automatically assigning IPN to parts created with empty IPN fields.\
         IPN pattern syntax can be found on the website linked here."
@@ -62,27 +60,34 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
         },
     }
 
-    min_pattern_char = ord("A")
-    max_pattern_char = ord("Z")
-    skip_chars = range(ord("["), ord("a"))
-
     def wants_process_event(self, event):
         """Lets InvenTree know what events to listen for."""
 
         if not self.get_setting("ACTIVE"):
             return False
 
-        if event == "part_part.saved":
-            return self.get_setting("ON_CHANGE")
+        return event == "part_part.saved" or (
+            event == "part_part.created" and self.get_setting("ON_CREATE")
+        )
 
-        if event == "part_part.created":
-            return self.get_setting("ON_CREATE")
+    def is_ipn_unique(self, ipn, exclude_pk=None):
+        qs = Part.objects.filter(IPN__iexact=ipn)
+        if exclude_pk is not None:
+            qs = qs.exclude(pk=exclude_pk)
+        return not qs.exists()
 
-        return False
+    def find_unique_ipn(self, pattern):
+        ipn = ipn_pattern.IPN(pattern)
+        while 1:
+            ipns = str(ipn)
+            if self.is_ipn_unique(ipns):
+                return ipns
+            ipn.inc()
 
     def process_event(self, event, *args, **kwargs):
         """Main plugin handler function"""
 
+        #logger.warning(f"ipn_generator handling event: {event}")
         if not self.get_setting("ACTIVE"):
             return False
 
@@ -91,29 +96,32 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
 
         # Events can fire on unrelated models
         if model != "Part":
-            logger.debug("IPN Generator: Event Model is not part")
+            logger.warning("IPN Generator: Event Model is not part")
             return
 
         if event.endswith(".deleted"):
-            logger.debug("IPN Generator: Event part deleted")
+            logger.warning("IPN Generator: Event part deleted")
             return
 
         # Don't create IPNs for parts with IPNs
         part = Part.objects.get(id=id)
-        if part.IPN != "auto":
+        #logger.warning(f"ipn generator: part: {part} / part.IPN: {part.IPN}")
+        # but always regenerate if the IPN field is auto
+        regen = False
+        if part.IPN == "auto":
+            regen = True
+        elif (
+            (event == "part_part.saved" and self.get_setting("ON_CHANGE"))
+            or (event == "part_part.created" and self.get_setting("ON_CREATE"))
+        ):
+            if part.IPN is None or part.IPN == "":
+                regen = True
+        
+        if not regen:
             return
 
         pattern = self.get_pattern_for_part(part)
-
-        expression = self.construct_regex(pattern, True)
-        latest = Part.objects.filter(IPN__regex=expression).order_by("-IPN").first()
-
-        if not latest:
-            part.IPN = self.construct_first_ipn(pattern)
-        else:
-            grouped_expression = self.construct_regex(pattern)
-            part.IPN = self.increment_ipn(grouped_expression, latest.IPN)
-
+        part.IPN = self.find_unique_ipn(pattern)
         part.save()
 
         return
@@ -130,196 +138,19 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
         if not category:
             return pattern
 
-        prefix = None
-        prefix_param = category.get_parameter("IPN Prefix")
-        if prefix_param:
-            prefix = prefix_param.data
-            logging.error(f"prefix param part #{part.id} param: #{prefix}")
+        pattern = None
+        pattern_param = category.get_parameter("IPN Pattern")
+        if pattern_param:
+            pattern = pattern_param.data
+            logger.warning(f"pattern param for part '{part.id}' param: '{pattern}'")
 
         else:
             while category.parent is not None:
                 category = category.parent
-                prefix_param = category.get_parameter("IPN Prefix")
-                if prefix_param:
-                    prefix = prefix_param.data
+                pattern_param = category.get_parameter("IPN Pattern")
+                if pattern_param:
+                    pattern = pattern_param.data
                     break
 
-        if not prefix:
-            return pattern
+        return pattern
 
-        allowed = rf"[^0-9A-Za-z{re.escape(PERMITTED_SPECIAL_LITERALS)}]"
-        sanitized_prefix = re.sub(allowed, "", str(prefix))
-
-        if not sanitized_prefix:
-            return pattern
-
-        return re.sub(
-            r"\([\w\(\)\-.:/\\]+\)", f"({sanitized_prefix})", pattern, count=1
-        )
-
-    def construct_regex(self, pattern=None, disable_groups=False):
-        """Constructs a valid regex from provided IPN pattern.
-        This regex is used to find the latest assigned IPN
-        """
-        regex = "^"
-
-        if pattern is None:
-            pattern = self.get_setting("PATTERN")
-
-        m = re.findall(
-            r"(\{\d+\+?\})|(\([\w\(\)\-.:/\\]+\))|(\[(?:\w+|\w-\w)+\])",
-            pattern,
-        )
-
-        for idx, group in enumerate(m):
-            numeric, literal, character = group
-            # Numeric, increment
-            if numeric:
-                start = "+" in numeric
-                g = numeric.strip("{}+")
-                if start:
-                    regex += "("
-                    if not disable_groups:
-                        regex += f"?P<Np{g}i{idx}>"
-                    for char in g:
-                        regex += f"[{char}-9]"
-                else:
-                    regex += "("
-                    if not disable_groups:
-                        regex += f"?P<N{g}i{idx}>"
-                    regex += f"\d{ {int(g)} }"
-                regex += ")"
-
-            # Literal, won't change
-            if literal:
-                lit = literal.strip("()")
-                regex += "("
-                if not disable_groups:
-                    regex += f"?P<Li{idx}>"
-                regex += f"{re.escape(lit)})"
-
-            # Letters, a collection or sequence
-            # Sequences incremented using ASCII
-            if character:
-                regex += "("
-                if not disable_groups:
-                    regex += "?P<C"
-
-                sequences = re.findall(r"(\w)(?!-)|(\w\-\w)", character)
-
-                exp = []
-                for seq in sequences:
-                    single, range = seq
-
-                    if single:
-                        exp.append(single)
-                    elif range:
-                        exp.append(range)
-
-                if not disable_groups:
-                    regex += f"{'_'.join(exp).replace('-', '')}i{idx}>"
-                regex += f"[{''.join(exp)}]"
-                regex += ")"
-
-        regex += "$"
-
-        return regex
-
-    def increment_ipn(self, exp, latest):
-        """Deconstructs IPN pattern based on latest IPN and constructs a the next IPN in the series."""
-        m: re.Match = re.match(exp, latest)
-
-        ipn_list = []
-
-        # True after a fields has been incremented
-        # Does not apply on count rollover (i.e. 999 -> 001)
-        incremented = False
-
-        for key, val in reversed(m.groupdict().items()):
-            type, _ = key.split("i")
-
-            if incremented or type == "L":
-                ipn_list.append(val)
-                continue
-
-            if type == "N":
-                ipn_list.append(str(int(val) + 1))
-                incremented = True
-            elif type.startswith("C"):
-                integerized_char = ord(val)
-                choices = type[1:].split("_")
-
-                ranges = any(len(x) > 1 for x in choices)
-
-                if not ranges:
-                    if choices.index(val) == len(choices) - 1:
-                        ipn_list.append(choices[0])
-                    else:
-                        ipn_list.append(choices[choices.index(val) + 1])
-                        incremented = True
-                else:
-                    for choice in choices:
-                        if len(choice) > 1:
-                            min = ord(choice[0])
-                            max = ord(choice[1])
-                            if integerized_char in range(min, max + 1):
-                                if integerized_char == max:
-                                    ipn_list.append(choice[0])
-                                else:
-                                    ipn_list.append(chr(integerized_char + 1))
-                                incremented = True
-                                break
-                        elif choices.index(val) < choices.index(choice):
-                            ipn_list.append(choice)
-                            incremented = True
-                            break
-
-            elif type.startswith("N"):
-                if type[1] == "p":
-                    num = int(type[2:])
-                else:
-                    num = int(type[1:])
-                if type[1] == "p":
-                    next = int(val) + 1
-                    if len(str(next)) > len(type[2:]):
-                        ipn_list.append(type[2:])
-                    else:
-                        ipn_list.append(str(next))
-                elif len(str(int(val) + 1)) > num:
-                    ipn_list.append(str(1).zfill(num))
-                else:
-                    ipn_list.append(str(int(val) + 1).zfill(num))
-                    incremented = True
-
-        ipn_list.reverse()
-        return "".join(ipn_list)
-
-    def construct_first_ipn(self, pattern=None):
-        """No IPNs matching the pattern were found. Constructing the first IPN."""
-
-        if pattern is None:
-            pattern = self.get_setting("PATTERN")
-
-        m = re.findall(
-            r"(\{\d+\+?\})|(\([\w\(\)\-.:/\\]+\))|(\[(?:\w+|(?:\w-\w)+)\])",
-            pattern,
-        )
-
-        ipn = ""
-
-        for group in m:
-            numeric, literal, character = group
-            if numeric:
-                num = numeric.strip("{}+")
-                if "+" in numeric:
-                    ipn += num
-                else:
-                    ipn += str(1).zfill(int(num))
-
-            if literal:
-                ipn += literal.strip("()")
-
-            if character:
-                ipn += character.strip("[]")[0]
-
-        return ipn
