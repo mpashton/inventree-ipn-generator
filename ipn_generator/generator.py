@@ -1,9 +1,10 @@
 import logging
+import re
 
 from django.core.exceptions import ValidationError
 from part.models import Part
 from plugin import InvenTreePlugin
-from plugin.mixins import EventMixin, SettingsMixin
+from plugin.mixins import SettingsMixin, ValidationMixin
 from . import ipn_pattern
 
 logger = logging.getLogger("inventree")
@@ -18,7 +19,7 @@ def validate_pattern(pattern):
     return True
 
 
-class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
+class AutoGenIPNPlugin(ValidationMixin, SettingsMixin, InvenTreePlugin):
     """Plugin to generate IPN automatically"""
 
     AUTHOR = "Michael Ashton, Nichlas W., et al"
@@ -60,71 +61,55 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
         },
     }
 
-    def wants_process_event(self, event):
-        """Lets InvenTree know what events to listen for."""
-
-        if not self.get_setting("ACTIVE"):
-            return False
-
-        return event == "part_part.saved" or (
-            event == "part_part.created" and self.get_setting("ON_CREATE")
-        )
-
     def is_ipn_unique(self, ipn, exclude_pk=None):
         qs = Part.objects.filter(IPN__iexact=ipn)
         if exclude_pk is not None:
             qs = qs.exclude(pk=exclude_pk)
         return not qs.exists()
 
-    def find_unique_ipn(self, pattern):
+    def find_unique_ipn(self, pattern, exclude_pk=None):
         ipn = ipn_pattern.IPN(pattern)
         while 1:
             ipns = str(ipn)
-            if self.is_ipn_unique(ipns):
+            if self.is_ipn_unique(ipns, exclude_pk=exclude_pk):
                 return ipns
             ipn.inc()
 
-    def process_event(self, event, *args, **kwargs):
-        """Main plugin handler function"""
+    def validate_model_instance(self, instance, deltas=None):
+        """Assign an IPN to a Part before it is written to the database.
 
-        #logger.warning(f"ipn_generator handling event: {event}")
+        InvenTree (1.2+) calls this synchronously from Part.full_clean() and
+        Part.save() via PluginValidationMixin, on the same instance the API
+        serializes into its response, so the generated IPN is visible on the
+        part page immediately. Never call save() here - the caller is saving.
+        Return None (not True) so other validation plugins still run.
+        """
+
+        if not isinstance(instance, Part):
+            return None
+
         if not self.get_setting("ACTIVE"):
-            return False
+            return None
 
-        id = kwargs.pop("id", None)
-        model = kwargs.pop("model", None)
+        is_new = instance.pk is None or instance._state.adding
 
-        # Events can fire on unrelated models
-        if model != "Part":
-            logger.warning("IPN Generator: Event Model is not part")
-            return
-
-        if event.endswith(".deleted"):
-            logger.warning("IPN Generator: Event part deleted")
-            return
-
-        # Don't create IPNs for parts with IPNs
-        part = Part.objects.get(id=id)
-        #logger.warning(f"ipn generator: part: {part} / part.IPN: {part.IPN}")
-        # but always regenerate if the IPN field is auto
+        # Always regenerate if the IPN field is "auto"
         regen = False
-        if part.IPN == "auto":
+        if instance.IPN == "auto":
             regen = True
-        elif (
-            (event == "part_part.saved" and self.get_setting("ON_CHANGE"))
-            or (event == "part_part.created" and self.get_setting("ON_CREATE"))
-        ):
-            if part.IPN is None or part.IPN == "":
-                regen = True
-        
+        elif instance.IPN is None or instance.IPN == "":
+            if is_new:
+                regen = bool(self.get_setting("ON_CREATE"))
+            else:
+                regen = bool(self.get_setting("ON_CHANGE"))
+
         if not regen:
-            return
+            return None
 
-        pattern = self.get_pattern_for_part(part)
-        part.IPN = self.find_unique_ipn(pattern)
-        part.save()
+        pattern = self.get_pattern_for_part(instance)
+        instance.IPN = self.find_unique_ipn(pattern, exclude_pk=instance.pk)
 
-        return
+        return None
 
     def get_pattern_for_part(self, part):
         """Return the pattern for a given part, applying category metadata overrides."""
@@ -151,6 +136,9 @@ class AutoGenIPNPlugin(EventMixin, SettingsMixin, InvenTreePlugin):
                 if pattern_param:
                     pattern = pattern_param.data
                     break
+
+        if not pattern:
+            pattern = self.get_setting("PATTERN")
 
         return pattern
 

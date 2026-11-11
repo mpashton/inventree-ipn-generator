@@ -2,10 +2,8 @@ from django.test import TestCase
 from django.core.exceptions import ValidationError
 import logging
 
-from django.conf import settings
-from part.models import PartCategory, SupplierPart, Part
-from company.models import Company
-from common.models import InvenTreeSetting
+from part.models import PartCategory, Part
+from company.models import Company, SupplierPart
 
 from plugin import registry
 
@@ -13,9 +11,6 @@ logger = logging.getLogger("inventree")
 
 
 def setup_func(cls):
-    settings.PLUGIN_TESTING_EVENTS = True
-    settings.TESTING_TABLE_EVENTS = True
-    InvenTreeSetting.set_setting("ENABLE_PLUGINS_EVENTS", True)
     cls.plugin = registry.get_plugin("ipngen")
     conf = cls.plugin.plugin_config()
     conf.active = True
@@ -23,9 +18,7 @@ def setup_func(cls):
 
 
 def teardown_func():
-    settings.PLUGIN_TESTING_EVENTS = False
-    settings.TESTING_TABLE_EVENTS = False
-    InvenTreeSetting.set_setting("ENABLE_PLUGINS_EVENTS", False)
+    pass
 
 
 class IPNGeneratorPatternTests(TestCase):
@@ -426,15 +419,100 @@ class IPNGeneratorModelTests(TestCase):
         teardown_func()
 
     def test_supplier_part_does_not_trigger_plugin(self):
-        """Supplier parts events should not trigger the plugin"""
+        """Saving a non-Part model must not touch any Part's IPN"""
+
+        self.plugin.set_setting("PATTERN", "{3}")
 
         cat = PartCategory.objects.all().first()
         part = Part.objects.create(category=cat, name="PartName")
         supplier = Company.objects.create(name="Suppliercompany", currency="USD")
 
-        with self.assertLogs(logger=logger, level="DEBUG") as cm:
-            SupplierPart.objects.create(part=part, SKU="abc", supplier=supplier)
-            self.assertNotIn(
-                "DEBUG:inventree:Plugin 'ipngen' is processing triggered event 'part_part.created'",
-                cm[1],
-            )
+        SupplierPart.objects.create(part=part, SKU="abc", supplier=supplier)
+
+        self.assertEqual(Part.objects.get(pk=part.pk).IPN, "001")
+        self.assertEqual(Part.objects.filter(IPN="002").count(), 0)
+
+    def test_ipn_set_on_instance_at_create(self):
+        """The IPN must be on the saved instance itself, without a DB re-read.
+
+        The API serializes this same instance into its response, so this is
+        what makes the IPN appear on the part page without a reload.
+        """
+
+        self.plugin.set_setting("PATTERN", "{3}")
+
+        cat = PartCategory.objects.all().first()
+        part = Part.objects.create(category=cat, name="PartName")
+
+        self.assertEqual(part.IPN, "001")
+
+    def test_existing_ipn_kept(self):
+        """A user-supplied IPN is left alone"""
+
+        self.plugin.set_setting("PATTERN", "{3}")
+
+        cat = PartCategory.objects.all().first()
+        part = Part.objects.create(category=cat, name="PartName", IPN="MINE-1")
+
+        self.assertEqual(part.IPN, "MINE-1")
+
+        part.description = "edited"
+        part.save()
+        self.assertEqual(Part.objects.get(pk=part.pk).IPN, "MINE-1")
+
+    def test_auto_regenerates_on_edit(self):
+        """Setting IPN to 'auto' on an existing part regenerates it in place"""
+
+        self.plugin.set_setting("PATTERN", "{3}")
+
+        cat = PartCategory.objects.all().first()
+        part = Part.objects.create(category=cat, name="PartName", IPN="MINE-1")
+
+        part.IPN = "auto"
+        part.save()
+
+        self.assertEqual(part.IPN, "001")
+        self.assertEqual(Part.objects.get(pk=part.pk).IPN, "001")
+
+    def test_auto_regenerate_does_not_clash_with_self(self):
+        """Regenerating an existing part may reuse the number it already holds"""
+
+        self.plugin.set_setting("PATTERN", "{3}")
+
+        cat = PartCategory.objects.all().first()
+        part = Part.objects.create(category=cat, name="PartName")
+        self.assertEqual(part.IPN, "001")
+
+        part.IPN = "auto"
+        part.save()
+
+        self.assertEqual(part.IPN, "001")
+
+    def test_edit_empty_ipn_respects_on_change(self):
+        """Clearing the IPN on edit only regenerates when ON_CHANGE is set"""
+
+        self.plugin.set_setting("PATTERN", "{3}")
+        self.plugin.set_setting("ON_CHANGE", False)
+
+        cat = PartCategory.objects.all().first()
+        part = Part.objects.create(category=cat, name="PartName", IPN="MINE-1")
+
+        part.IPN = ""
+        part.save()
+        self.assertIn(Part.objects.get(pk=part.pk).IPN, ("", None))
+
+        self.plugin.set_setting("ON_CHANGE", True)
+        part.IPN = ""
+        part.save()
+        self.assertEqual(Part.objects.get(pk=part.pk).IPN, "001")
+
+    def test_create_respects_on_create(self):
+        """With ON_CREATE off, a new part with no IPN is left without one"""
+
+        self.plugin.set_setting("PATTERN", "{3}")
+        self.plugin.set_setting("ON_CREATE", False)
+
+        cat = PartCategory.objects.all().first()
+        part = Part.objects.create(category=cat, name="PartName")
+
+        self.assertIn(part.IPN, ("", None))
